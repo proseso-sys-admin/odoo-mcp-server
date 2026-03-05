@@ -21,6 +21,8 @@ steps:
       - '--platform'
       - 'managed'
       - '--allow-unauthenticated'
+      - '--set-secrets'
+      - 'MCP_SECRET=odoo-mcp-secret:latest,ODOO_AP_WORKER_SECRET=odoo-ap-worker-secret:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/odoo-mcp-server:$COMMIT_SHA'

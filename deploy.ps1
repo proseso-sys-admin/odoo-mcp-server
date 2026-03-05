@@ -14,12 +14,9 @@ $IMAGE        = "gcr.io/$PROJECT_ID/$SERVICE_NAME"
 # Odoo connections — update api_key if it ever rotates
 $ODOO_CONNECTIONS = '{"connections":{},"default":null}'
 
-# AP Worker — fill in your existing Cloud Run AP worker URL and secret
-$ODOO_AP_WORKER_URL    = "https://ap-bill-ocr-worker-727082425075.asia-southeast1.run.app"   # <-- update this
-$ODOO_AP_WORKER_SECRET = "Papaya3562"                # <-- update this
+# AP Worker — fill in your existing Cloud Run AP worker URL
+$ODOO_AP_WORKER_URL    = "https://ap-bill-ocr-worker-727082425075.asia-southeast1.run.app"
 
-# Fixed secret to protect the MCP endpoint
-$MCP_SECRET = "km46op1ljw9c8syugv7adx30qe25birn"
 # ──────────────────────────────────────────────────────────────────────────────
 
 Write-Host ""
@@ -28,7 +25,7 @@ gcloud config configurations activate odoo-ap-worker
 
 Write-Host ""
 Write-Host "=> Enabling required APIs..." -ForegroundColor Cyan
-gcloud services enable cloudbuild.googleapis.com run.googleapis.com `
+gcloud services enable cloudbuild.googleapis.com run.googleapis.com secretmanager.googleapis.com `
   --project $PROJECT_ID
 
 Write-Host ""
@@ -38,24 +35,15 @@ gcloud builds submit . `
   --project $PROJECT_ID
 
 Write-Host ""
-Write-Host "=> Writing env vars file..." -ForegroundColor Cyan
-$envFile = ".\env-vars.yaml"
-@"
-MCP_SECRET: "$MCP_SECRET"
-ODOO_CONNECTIONS: '$ODOO_CONNECTIONS'
-ODOO_AP_WORKER_URL: "$ODOO_AP_WORKER_URL"
-ODOO_AP_WORKER_SECRET: "$ODOO_AP_WORKER_SECRET"
-"@ | Out-File -FilePath $envFile -Encoding utf8
-
-Write-Host ""
-Write-Host "=> Deploying to Cloud Run..." -ForegroundColor Cyan
+Write-Host "=> Deploying to Cloud Run with Secret Manager..." -ForegroundColor Cyan
 gcloud run deploy $SERVICE_NAME `
   --image $IMAGE `
   --platform managed `
   --region $REGION `
   --project $PROJECT_ID `
   --allow-unauthenticated `
-  --env-vars-file $envFile `
+  --set-env-vars "ODOO_CONNECTIONS=$ODOO_CONNECTIONS,ODOO_AP_WORKER_URL=$ODOO_AP_WORKER_URL" `
+  --set-secrets "MCP_SECRET=odoo-mcp-secret:latest,ODOO_AP_WORKER_SECRET=odoo-ap-worker-secret:latest" `
   --min-instances 0 `
   --max-instances 2 `
   --memory 256Mi `
