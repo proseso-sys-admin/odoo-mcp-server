@@ -1,0 +1,1 @@
+ODOO_MCP_URL=https://odoo-mcp-server-njiacix2yq-as.a.run.app/sse
