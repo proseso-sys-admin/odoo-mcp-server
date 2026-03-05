@@ -24,7 +24,7 @@ steps:
       - '--set-secrets'
       - 'MCP_SECRET=odoo-mcp-secret:latest,ODOO_AP_WORKER_SECRET=odoo-ap-worker-secret:latest'
       - '--set-env-vars'
-      - 'ODOO_CONNECTIONS={"connections":{},"default":null},ODOO_AP_WORKER_URL=https://ap-bill-ocr-worker-727082425075.asia-southeast1.run.app'
+      - '^@^ODOO_CONNECTIONS={"connections":{},"default":null}@ODOO_AP_WORKER_URL=https://ap-bill-ocr-worker-727082425075.asia-southeast1.run.app'
 
 options:
   logging: CLOUD_LOGGING_ONLY
