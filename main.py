@@ -61,12 +61,13 @@ _uid_cache: dict[str, int] = {}
 
 
 def _get_connection(config: dict, key: str) -> dict:
-    """Resolve a connection by name OR by inline JSON spec."""
+    """Resolve a connection by name, inline JSON, or pipe-delimited string."""
     conns = config.get("connections", {})
 
     if key in conns:
         return conns[key]
 
+    # Inline JSON: {"url": "...", "api_key": "...", ...}
     try:
         inline = json.loads(key)
         if isinstance(inline, dict) and "url" in inline and "api_key" in inline:
@@ -78,6 +79,14 @@ def _get_connection(config: dict, key: str) -> dict:
             return inline
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
+
+    # Pipe-delimited: url|db|user|api_key
+    parts = key.split("|")
+    if len(parts) == 4 and parts[0].startswith("http"):
+        return {"url": parts[0], "db": parts[1], "user": parts[2], "api_key": parts[3]}
+    if len(parts) == 3 and parts[0].startswith("http"):
+        host = urlparse(parts[0]).hostname or ""
+        return {"url": parts[0], "db": host.split(".")[0], "user": parts[1], "api_key": parts[2]}
 
     raise ValueError(
         f"Connection '{key}' not found. Available: {list(conns.keys())}"
