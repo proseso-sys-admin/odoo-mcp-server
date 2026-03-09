@@ -101,10 +101,20 @@ def _authenticate(conn: dict) -> tuple[str, int, str]:
 
     cache_key = f"{url}|{db}|{user}"
     if cache_key not in _uid_cache:
-        common = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/common", allow_none=True
-        )
-        uid = common.authenticate(db, user, api_key, {})
+        try:
+            common = xmlrpc.client.ServerProxy(
+                f"{url}/xmlrpc/2/common", allow_none=True
+            )
+            uid = common.authenticate(db, user, api_key, {})
+        except xmlrpc.client.Fault as e:
+            raise ValueError(
+                f"Odoo rejected authentication for {user}@{db} on {url}: {str(e.faultString)[:200]}"
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Cannot reach Odoo at {url}: {type(e).__name__}: {str(e)[:200]}. "
+                "Check that the URL is correct and the server is reachable."
+            )
         if not uid:
             raise ValueError(
                 f"Authentication failed for {user}@{db} on {url}. "
@@ -272,6 +282,7 @@ def odoo_list_connections() -> dict:
 def odoo_authenticate(url: str, user: str, api_key: str, db: str = "", transport: str = "xmlrpc") -> str:
     """
     Validate credentials and return a connection JSON string for all other tools.
+    Pass the returned string as the 'connection' argument to every other tool.
     Set transport='json2' to use the Odoo 19+ JSON-2 API instead of XML-RPC.
     """
     if not db:
@@ -279,7 +290,10 @@ def odoo_authenticate(url: str, user: str, api_key: str, db: str = "", transport
         db = host.split(".")[0]
 
     conn = {"url": url, "db": db, "user": user, "api_key": api_key, "transport": transport}
-    _authenticate(conn)
+    try:
+        _authenticate(conn)
+    except ValueError as e:
+        return json.dumps({"error": True, "message": str(e)})
     return json.dumps(conn)
 
 
