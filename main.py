@@ -23,14 +23,19 @@ import json
 import os
 import re
 import xmlrpc.client
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
+from mcp.server.sse import SseServerTransport
+from sse_starlette.sse import EventSourceResponse
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+from starlette.types import Receive, Scope, Send
 
 # -- Constants -----------------------------------------------------------------
 
@@ -238,6 +243,35 @@ def _parse_xmlrpc_error(fault: xmlrpc.client.Fault, model: str, method: str) -> 
     result["message"] = f"Odoo error on {model}.{method}: {msg[:300]}"
     return result
 
+
+# -- SSE keep-alive patch ------------------------------------------------------
+# The MCP SDK creates EventSourceResponse without a ping interval, so Cloud Run
+# (and similar proxies) kill the idle SSE connection at their request timeout
+# boundary.  We patch connect_sse to inject ping=15 (seconds) which sends a
+# keep-alive comment every 15 s, well within typical 60-300 s proxy timeouts.
+
+_orig_connect_sse = SseServerTransport.connect_sse
+
+
+@asynccontextmanager
+async def _patched_connect_sse(self, scope: Scope, receive: Receive, send: Send):
+    # Reuse the original generator but intercept EventSourceResponse construction.
+    _orig_ESR = EventSourceResponse.__init__
+
+    def _patched_esr_init(esr_self, *args, **kwargs):
+        kwargs.setdefault("ping", 15)
+        kwargs.setdefault("send_timeout", 30)
+        _orig_ESR(esr_self, *args, **kwargs)
+
+    EventSourceResponse.__init__ = _patched_esr_init
+    try:
+        async with _orig_connect_sse(self, scope, receive, send) as streams:
+            yield streams
+    finally:
+        EventSourceResponse.__init__ = _orig_ESR
+
+
+SseServerTransport.connect_sse = _patched_connect_sse
 
 # -- MCP Server ----------------------------------------------------------------
 
