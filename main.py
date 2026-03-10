@@ -525,6 +525,51 @@ def odoo_call(
 
 
 # =============================================================================
+# MESSAGING & CHATTER
+# =============================================================================
+
+@mcp.tool()
+def odoo_send_message(
+    connection: str,
+    model: str,
+    res_id: int,
+    body: str,
+    subject: str = "",
+    message_type: str = "comment",
+    subtype_xmlid: str = "mail.mt_comment",
+    partner_ids: list = [],
+    context: dict = {},
+) -> dict:
+    """
+    Post a message or send an email via Odoo's Chatter on a specific record.
+    model: e.g., 'project.task', 'account.move', 'crm.lead'.
+    res_id: the ID of the record.
+    body: the HTML body of the message.
+    message_type: 'comment' (customer visible) or 'notification' (internal note).
+    partner_ids: list of partner IDs to notify/email.
+    """
+    conn = _conn(connection)
+    kw: dict[str, Any] = {
+        "body": body,
+        "message_type": message_type,
+        "subtype_xmlid": subtype_xmlid,
+    }
+    if subject:
+        kw["subject"] = subject
+    if partner_ids:
+        kw["partner_ids"] = partner_ids
+
+    ctx = _build_context(context)
+    if ctx:
+        kw["context"] = ctx
+
+    result = _execute(conn, model, "message_post", [res_id], **kw)
+    if isinstance(result, dict) and result.get("error"):
+        return result
+    return {"message_id": result, "success": True}
+
+
+# =============================================================================
 # ADVANCED ORM TOOLS
 # =============================================================================
 
