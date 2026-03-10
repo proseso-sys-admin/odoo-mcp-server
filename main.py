@@ -1149,6 +1149,233 @@ def odoo_create_custom_field(
 
 
 # =============================================================================
+# MULTI-DATABASE EXTRACTION
+# =============================================================================
+
+@mcp.tool()
+def odoo_multi_db_extract(
+    queries: list,
+    connections: list = [],
+    stop_on_error: bool = False,
+) -> dict:
+    """
+    Extract information from multiple Odoo databases in one call.
+
+    Runs every query against every connection (or all configured connections
+    if 'connections' is empty), then returns results grouped by connection.
+
+    queries: list of query dicts, each with:
+      - label     (str, required): friendly name for this query (e.g. "open_invoices")
+      - model     (str, required): Odoo model (e.g. "account.move")
+      - method    (str, optional): ORM method, default "search_read"
+      - domain    (list, optional): Odoo domain filter, default []
+      - fields    (list, optional): fields to return, default ["id","display_name"]
+      - limit     (int, optional): max records, default 100
+      - offset    (int, optional): pagination offset, default 0
+      - order     (str, optional): sort order
+      - groupby   (list, optional): for read_group queries
+      - kwargs    (dict, optional): extra kwargs passed to execute_kw
+      - context   (dict, optional): Odoo context overrides
+
+    connections: list of connection keys to query. If empty, ALL configured
+                 connections are used.
+
+    stop_on_error: if True, abort remaining connections on first error.
+
+    Example:
+      queries=[
+        {"label": "open_invoices", "model": "account.move",
+         "domain": [["state","=","posted"],["payment_state","!=","paid"],["move_type","in",["out_invoice","out_refund"]]],
+         "fields": ["name","partner_id","amount_total","amount_residual","invoice_date_due","state"]},
+        {"label": "customer_count", "model": "res.partner",
+         "method": "search_count", "domain": [["customer_rank",">",0]]},
+        {"label": "revenue_by_month", "model": "account.move.line",
+         "method": "read_group",
+         "domain": [["parent_state","=","posted"],["account_id.account_type","=","income"]],
+         "fields": ["balance:sum"], "groupby": ["date:month"]}
+      ]
+
+    Returns:
+      {
+        "results": {
+          "connection_key": {
+            "url": "...", "db": "...",
+            "queries": {
+              "open_invoices": {"records": [...], "metadata": {...}},
+              "customer_count": {"count": 42},
+              ...
+            },
+            "errors": []
+          },
+          ...
+        },
+        "summary": {"total_connections": 3, "successful": 3, "failed": 0}
+      }
+    """
+    config = load_config()
+    all_conns = config.get("connections", {})
+
+    target_keys = connections if connections else list(all_conns.keys())
+    if not target_keys:
+        return {"error": True, "message": "No connections configured. Set ODOO_CONNECTIONS or pass explicit connection keys."}
+
+    if not queries:
+        return {"error": True, "message": "No queries provided. Pass at least one query dict with 'label' and 'model'."}
+
+    for i, q in enumerate(queries):
+        if not q.get("label"):
+            return {"error": True, "message": f"Query {i} is missing a 'label'."}
+        if not q.get("model"):
+            return {"error": True, "message": f"Query '{q.get('label', i)}' is missing a 'model'."}
+
+    results: dict[str, Any] = {}
+    successful = 0
+    failed = 0
+
+    for key in target_keys:
+        try:
+            conn = _get_connection(config, key)
+        except ValueError as e:
+            results[key] = {"error": str(e), "queries": {}}
+            failed += 1
+            if stop_on_error:
+                break
+            continue
+
+        conn_result: dict[str, Any] = {
+            "url": conn.get("url", ""),
+            "db": conn.get("db", ""),
+            "queries": {},
+            "errors": [],
+        }
+
+        conn_ok = True
+        for q in queries:
+            label = q["label"]
+            model = q["model"]
+            method = q.get("method", "search_read")
+            domain = q.get("domain", [])
+            fields = q.get("fields", [])
+            limit = q.get("limit", DEFAULT_LIMIT)
+            offset = q.get("offset", 0)
+            order = q.get("order", "")
+            groupby = q.get("groupby", [])
+            extra_kw = q.get("kwargs", {})
+            context = q.get("context", {})
+
+            try:
+                if method == "search_read":
+                    if not fields:
+                        fields = ["id", "display_name"]
+                    cap = HARD_CAP_NARROW if len(fields) <= NARROW_FIELD_THRESHOLD else HARD_CAP_WIDE
+                    effective_limit = min(limit, cap) if limit > 0 else min(DEFAULT_LIMIT, cap)
+                    kw: dict[str, Any] = {
+                        "limit": effective_limit,
+                        "offset": offset,
+                        "fields": fields,
+                        **extra_kw,
+                    }
+                    if order:
+                        kw["order"] = order
+                    ctx = _build_context(context)
+                    if ctx:
+                        kw["context"] = ctx
+
+                    records = _execute(conn, model, "search_read", domain, **kw)
+                    if isinstance(records, dict) and records.get("error"):
+                        conn_result["queries"][label] = records
+                        conn_result["errors"].append({"label": label, "error": records.get("message", str(records))})
+                    else:
+                        total_kw: dict[str, Any] = {}
+                        if ctx:
+                            total_kw["context"] = ctx
+                        total = _execute(conn, model, "search_count", domain, **total_kw)
+                        if isinstance(total, dict) and total.get("error"):
+                            total = -1
+                        conn_result["queries"][label] = {
+                            "records": records,
+                            "metadata": {
+                                "count": len(records),
+                                "total": total,
+                                "offset": offset,
+                                "limit": effective_limit,
+                                "has_more": (offset + len(records)) < total if isinstance(total, int) else False,
+                            },
+                        }
+
+                elif method == "search_count":
+                    kw = {**extra_kw}
+                    ctx = _build_context(context)
+                    if ctx:
+                        kw["context"] = ctx
+                    count = _execute(conn, model, "search_count", domain, **kw)
+                    if isinstance(count, dict) and count.get("error"):
+                        conn_result["queries"][label] = count
+                        conn_result["errors"].append({"label": label, "error": count.get("message", str(count))})
+                    else:
+                        conn_result["queries"][label] = {"count": count}
+
+                elif method == "read_group":
+                    kw = {**extra_kw}
+                    if limit > 0:
+                        kw["limit"] = limit
+                    ctx = _build_context(context)
+                    if ctx:
+                        kw["context"] = ctx
+                    group_result = _execute(conn, model, "read_group", domain, fields, groupby, **kw)
+                    if isinstance(group_result, dict) and group_result.get("error"):
+                        conn_result["queries"][label] = group_result
+                        conn_result["errors"].append({"label": label, "error": group_result.get("message", str(group_result))})
+                    else:
+                        conn_result["queries"][label] = {
+                            "groups": group_result,
+                            "count": len(group_result) if isinstance(group_result, list) else 0,
+                        }
+
+                else:
+                    kw = {**extra_kw}
+                    ctx = _build_context(context)
+                    if ctx:
+                        kw["context"] = ctx
+                    args = [domain] if domain else []
+                    raw = _execute(conn, model, method, *args, **kw)
+                    conn_result["queries"][label] = {"result": raw}
+
+            except Exception as exc:
+                err_msg = f"{type(exc).__name__}: {str(exc)[:300]}"
+                conn_result["queries"][label] = {"error": True, "message": err_msg}
+                conn_result["errors"].append({"label": label, "error": err_msg})
+
+        if conn_result["errors"]:
+            conn_ok = False
+
+        if conn_ok:
+            successful += 1
+        else:
+            if conn_result["queries"]:
+                successful += 1
+            failed += 1
+
+        if not conn_result["errors"]:
+            del conn_result["errors"]
+
+        results[key] = conn_result
+
+        if stop_on_error and not conn_ok:
+            break
+
+    return {
+        "results": results,
+        "summary": {
+            "total_connections": len(target_keys),
+            "queried": len(results),
+            "successful": successful,
+            "failed": failed,
+        },
+    }
+
+
+# =============================================================================
 # AP WORKER (existing)
 # =============================================================================
 

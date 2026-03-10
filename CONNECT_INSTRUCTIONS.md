@@ -9,7 +9,7 @@ The Odoo MCP Server is deployed on Cloud Run. You do **not** need to install Pyt
 
 - **Server Type:** SSE (Server-Sent Events)
 - **URL:** `https://odoo-mcp-server-njiacix2yq-as.a.run.app/sse`
-
+https://odoo-mcp-server-njiacix2yq-as.a.run.app/sse
 ---
 
 ## How to Use (Authentication)
