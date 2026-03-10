@@ -247,31 +247,20 @@ def _parse_xmlrpc_error(fault: xmlrpc.client.Fault, model: str, method: str) -> 
 # -- SSE keep-alive patch ------------------------------------------------------
 # The MCP SDK creates EventSourceResponse without a ping interval, so Cloud Run
 # (and similar proxies) kill the idle SSE connection at their request timeout
-# boundary.  We patch connect_sse to inject ping=15 (seconds) which sends a
-# keep-alive comment every 15 s, well within typical 60-300 s proxy timeouts.
+# boundary. We permanently patch EventSourceResponse to inject ping=15 (seconds) 
+# and a custom ping message factory that sends an actual event instead of a 
+# comment, as some SSE client polyfills ignore comments for keep-alive tracking.
 
-_orig_connect_sse = SseServerTransport.connect_sse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
+_orig_ESR = EventSourceResponse.__init__
 
-@asynccontextmanager
-async def _patched_connect_sse(self, scope: Scope, receive: Receive, send: Send):
-    # Reuse the original generator but intercept EventSourceResponse construction.
-    _orig_ESR = EventSourceResponse.__init__
+def _patched_esr_init(esr_self, *args, **kwargs):
+    kwargs.setdefault("ping", 15)
+    kwargs.setdefault("ping_message_factory", lambda: ServerSentEvent(event="ping", data="keepalive"))
+    _orig_ESR(esr_self, *args, **kwargs)
 
-    def _patched_esr_init(esr_self, *args, **kwargs):
-        kwargs.setdefault("ping", 15)
-        kwargs.setdefault("send_timeout", 30)
-        _orig_ESR(esr_self, *args, **kwargs)
-
-    EventSourceResponse.__init__ = _patched_esr_init
-    try:
-        async with _orig_connect_sse(self, scope, receive, send) as streams:
-            yield streams
-    finally:
-        EventSourceResponse.__init__ = _orig_ESR
-
-
-SseServerTransport.connect_sse = _patched_connect_sse
+EventSourceResponse.__init__ = _patched_esr_init
 
 # -- MCP Server ----------------------------------------------------------------
 
