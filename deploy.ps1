@@ -47,7 +47,7 @@ gcloud run deploy $SERVICE_NAME `
   --min-instances 0 `
   --max-instances 2 `
   --memory 256Mi `
-  --timeout 300
+  --timeout 3600
 
 $SERVICE_URL = gcloud run services describe $SERVICE_NAME `
   --platform managed `
