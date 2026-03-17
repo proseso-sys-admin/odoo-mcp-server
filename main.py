@@ -24,7 +24,7 @@ import os
 import re
 import xmlrpc.client
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
 import anyio
@@ -36,6 +36,16 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.types import Receive, Scope, Send
+
+# -- Type aliases --------------------------------------------------------------
+
+# Every tool that talks to Odoo requires this parameter.
+# The value is the JSON string returned by odoo_authenticate — call that first.
+Connection = Annotated[
+    str,
+    "JSON string returned by odoo_authenticate. "
+    "You MUST call odoo_authenticate first and pass its exact return value here.",
+]
 
 # -- Constants -----------------------------------------------------------------
 
@@ -302,6 +312,49 @@ def odoo_list_connections() -> dict:
 
 
 @mcp.tool()
+def odoo_guide() -> dict:
+    """
+    Start here. Returns the required workflow and key tool reference for working with Odoo.
+    Call this when you are unsure what to do, or at the start of any Odoo session.
+    """
+    return {
+        "required_workflow": [
+            "1. AUTHENTICATE — call odoo_authenticate(url, user, api_key) and save the returned connection string",
+            "2. DISCOVER MODEL — call odoo_search_models(connection, query) if unsure of the model's technical name (e.g. 'invoice' → 'account.move')",
+            "3. DISCOVER FIELDS — call odoo_get_fields(connection, model) before querying; never guess field names",
+            "4. QUERY — call odoo_search / odoo_read / odoo_read_group with correct model and field names",
+        ],
+        "connection_string_rule": (
+            "odoo_authenticate returns a JSON string. "
+            "Pass that exact string as the 'connection' argument to every other tool."
+        ),
+        "domain_syntax": {
+            "AND (implicit)": "[('field1', '=', val1), ('field2', '=', val2)]",
+            "OR": "['|', ('field', '=', val1), ('field', '=', val2)]",
+            "NOT": "['!', ('field', '=', val)]",
+            "nested OR+AND": "['|', ('a','=',1), '&', ('b','=',2), ('c','=',3)]",
+            "all records": "[]",
+        },
+        "common_mistakes": [
+            "Calling odoo_search before odoo_authenticate",
+            "Guessing field names — always call odoo_get_fields first",
+            "Guessing model names — always call odoo_search_models first",
+            "Using Python 'or'/'and' instead of the '|'/'&' prefix operators in domains",
+        ],
+        "quick_reference": {
+            "find_model": "odoo_search_models(connection, 'invoice')",
+            "find_fields": "odoo_get_fields(connection, 'account.move', search_term='amount')",
+            "see_ui_fields": "odoo_get_views(connection, 'account.move', 'form')",
+            "aggregate": "odoo_read_group(connection, model, fields=['amount_total:sum'], groupby=['partner_id'])",
+            "check_defaults": "odoo_default_get(connection, model, fields) — see what Odoo auto-fills before create",
+            "include_archived": "pass context={'active_test': False} to any tool",
+            "bulk_ops": "odoo_execute_batch(connection, operations=[...])",
+            "cross_db": "odoo_multi_db_extract(queries=[...]) — runs against all configured DBs at once",
+        },
+    }
+
+
+@mcp.tool()
 def odoo_authenticate(url: str, user: str, api_key: str, db: str = "", transport: str = "xmlrpc") -> str:
     """
     Validate credentials and return a connection JSON string for all other tools.
@@ -326,7 +379,7 @@ def odoo_authenticate(url: str, user: str, api_key: str, db: str = "", transport
 
 @mcp.tool()
 def odoo_search(
-    connection: str,
+    connection: Connection,
     model: str,
     domain: list = [],
     fields: list = [],
@@ -338,9 +391,17 @@ def odoo_search(
     """
     Search Odoo records (search_read) with smart pagination.
 
-    Returns {"records": [...], "metadata": {count, total, has_more, next_offset}}.
+    BEFORE CALLING: use odoo_search_models to confirm the model's technical name,
+    and odoo_get_fields to discover valid field names. Never guess either.
+
+    Domain syntax — AND is implicit; OR uses the '|' prefix operator:
+      AND: [('field1', '=', val1), ('field2', '=', val2)]
+      OR:  ['|', ('field', '=', val1), ('field', '=', val2)]
+
+    Returns {"records": [...], "metadata": {"count", "total", "has_more", "next_offset"}}.
     Default fields are ['id', 'display_name'] if omitted.
-    Limit is auto-capped to protect context: 100 for wide queries, 1000 for narrow (<=5 fields).
+    Limit is auto-capped: 1000 for narrow queries (<=5 fields), 100 for wide.
+    Use metadata.has_more + next_offset to paginate.
     """
     conn = _conn(connection)
 
@@ -395,7 +456,7 @@ def odoo_search(
 
 @mcp.tool()
 def odoo_read(
-    connection: str,
+    connection: Connection,
     model: str,
     ids: list,
     fields: list = [],
@@ -414,12 +475,18 @@ def odoo_read(
 
 @mcp.tool()
 def odoo_create(
-    connection: str,
+    connection: Connection,
     model: str,
     vals: dict,
     context: dict = {},
 ) -> dict:
-    """Create a new Odoo record. Returns the new record ID."""
+    """
+    Create a new Odoo record. Returns {"id": <new_id>}.
+
+    BEFORE CALLING: use odoo_get_fields to know which fields are required,
+    and odoo_default_get to see what Odoo auto-fills (prevents conflicts with
+    sequences, default journals, and computed fields).
+    """
     conn = _conn(connection)
     kw: dict[str, Any] = {}
     ctx = _build_context(context)
@@ -433,13 +500,18 @@ def odoo_create(
 
 @mcp.tool()
 def odoo_write(
-    connection: str,
+    connection: Connection,
     model: str,
     ids: list,
     vals: dict,
     context: dict = {},
 ) -> dict:
-    """Update existing Odoo records."""
+    """
+    Update existing Odoo records. Returns {"success": True, "updated_ids": [...]}.
+
+    BEFORE CALLING: use odoo_get_fields to verify field names are correct.
+    Use odoo_search first to find the record IDs to update.
+    """
     conn = _conn(connection)
     kw: dict[str, Any] = {}
     ctx = _build_context(context)
@@ -453,7 +525,7 @@ def odoo_write(
 
 @mcp.tool()
 def odoo_delete(
-    connection: str,
+    connection: Connection,
     model: str,
     ids: list,
     context: dict = {},
@@ -481,7 +553,7 @@ def odoo_delete(
 
 @mcp.tool()
 def odoo_copy(
-    connection: str,
+    connection: Connection,
     model: str,
     id: int,
     default: dict = {},
@@ -506,7 +578,7 @@ def odoo_copy(
 
 @mcp.tool()
 def odoo_count(
-    connection: str,
+    connection: Connection,
     model: str,
     domain: list = [],
     context: dict = {},
@@ -525,7 +597,7 @@ def odoo_count(
 
 @mcp.tool()
 def odoo_call(
-    connection: str,
+    connection: Connection,
     model: str,
     method: str,
     args: list = [],
@@ -535,6 +607,8 @@ def odoo_call(
     """
     Call any Odoo method directly (execute_kw).
     Use for action_post, action_register_payment, or any method not covered by other tools.
+    args: positional arguments — for instance methods, the first arg is typically a list of record IDs.
+    kwargs: keyword arguments passed directly to execute_kw.
     """
     conn = _conn(connection)
     kw = dict(kwargs)
@@ -553,7 +627,7 @@ def odoo_call(
 
 @mcp.tool()
 def odoo_send_message(
-    connection: str,
+    connection: Connection,
     model: str,
     res_id: int,
     body: str,
@@ -598,7 +672,7 @@ def odoo_send_message(
 
 @mcp.tool()
 def odoo_read_group(
-    connection: str,
+    connection: Connection,
     model: str,
     domain: list = [],
     fields: list = [],
@@ -610,8 +684,10 @@ def odoo_read_group(
 ) -> dict:
     """
     Aggregate records using read_group (like SQL GROUP BY).
-    Example: fields=['amount_total:sum'], groupby=['partner_id', 'date:month']
-    Returns grouped results with __count and aggregated values.
+    Prefer this over odoo_search when you need totals, counts, or grouped data.
+    fields: aggregation specs, e.g. ['amount_total:sum', 'id:count']
+    groupby: group dimensions, e.g. ['partner_id', 'date:month']
+    Returns {"groups": [...], "count": N} where each group has __count and aggregated values.
     """
     conn = _conn(connection)
     kw: dict[str, Any] = {"lazy": lazy}
@@ -630,7 +706,7 @@ def odoo_read_group(
 
 @mcp.tool()
 def odoo_name_search(
-    connection: str,
+    connection: Connection,
     model: str,
     name: str = "",
     domain: list = [],
@@ -657,7 +733,7 @@ def odoo_name_search(
 
 @mcp.tool()
 def odoo_name_create(
-    connection: str,
+    connection: Connection,
     model: str,
     name: str,
     context: dict = {},
@@ -679,7 +755,7 @@ def odoo_name_create(
 
 @mcp.tool()
 def odoo_default_get(
-    connection: str,
+    connection: Connection,
     model: str,
     fields: list = [],
     context: dict = {},
@@ -698,7 +774,7 @@ def odoo_default_get(
 
 @mcp.tool()
 def odoo_get_metadata(
-    connection: str,
+    connection: Connection,
     model: str,
     ids: list,
 ) -> list:
@@ -715,7 +791,7 @@ def odoo_get_metadata(
 
 @mcp.tool()
 def odoo_search_models(
-    connection: str,
+    connection: Connection,
     query: str = "",
     limit: int = 20,
 ) -> list:
@@ -741,7 +817,7 @@ def odoo_search_models(
 
 @mcp.tool()
 def odoo_get_fields(
-    connection: str,
+    connection: Connection,
     model: str,
     attributes: list = ["string", "type", "required", "relation", "help"],
     search_term: str = "",
@@ -775,7 +851,7 @@ def odoo_get_fields(
 
 @mcp.tool()
 def odoo_get_views(
-    connection: str,
+    connection: Connection,
     model: str,
     view_type: str = "form",
     context: dict = {},
@@ -822,7 +898,7 @@ def odoo_get_views(
 
 @mcp.tool()
 def odoo_get_menus(
-    connection: str,
+    connection: Connection,
     model: str = "",
     limit: int = 50,
 ) -> list:
@@ -864,7 +940,7 @@ def odoo_get_menus(
 
 @mcp.tool()
 def odoo_check_access(
-    connection: str,
+    connection: Connection,
     model: str,
 ) -> dict:
     """
@@ -890,7 +966,7 @@ def odoo_check_access(
 
 
 @mcp.tool()
-def odoo_list_companies(connection: str) -> list:
+def odoo_list_companies(connection: Connection) -> list:
     """List all companies in an Odoo database (for multi-company setups)."""
     conn = _conn(connection)
     return _execute(
@@ -905,7 +981,7 @@ def odoo_list_companies(connection: str) -> list:
 
 @mcp.tool()
 def odoo_execute_batch(
-    connection: str,
+    connection: Connection,
     operations: list,
 ) -> dict:
     """
@@ -934,7 +1010,7 @@ def odoo_execute_batch(
 
 @mcp.tool()
 def odoo_upload_attachment(
-    connection: str,
+    connection: Connection,
     name: str,
     data_base64: str,
     res_model: str = "",
@@ -970,7 +1046,7 @@ def odoo_upload_attachment(
 
 @mcp.tool()
 def odoo_download_attachment(
-    connection: str,
+    connection: Connection,
     attachment_id: int,
 ) -> dict:
     """
@@ -1001,7 +1077,7 @@ def odoo_download_attachment(
 
 @mcp.tool()
 def odoo_get_report(
-    connection: str,
+    connection: Connection,
     report_name: str,
     record_ids: list,
     context: dict = {},
@@ -1046,7 +1122,7 @@ def odoo_get_report(
 
 @mcp.tool()
 def odoo_run_server_action(
-    connection: str,
+    connection: Connection,
     action_id: int,
     context: dict = {},
 ) -> dict:
@@ -1066,7 +1142,7 @@ def odoo_run_server_action(
 
 @mcp.tool()
 def odoo_list_crons(
-    connection: str,
+    connection: Connection,
     model: str = "",
     active_only: bool = True,
 ) -> list:
@@ -1089,7 +1165,7 @@ def odoo_list_crons(
 
 @mcp.tool()
 def odoo_trigger_cron(
-    connection: str,
+    connection: Connection,
     cron_id: int,
 ) -> dict:
     """Manually trigger a specific ir.cron scheduled action to run immediately."""
@@ -1106,7 +1182,7 @@ def odoo_trigger_cron(
 
 @mcp.tool()
 def odoo_create_custom_field(
-    connection: str,
+    connection: Connection,
     model: str,
     name: str,
     field_type: str,
