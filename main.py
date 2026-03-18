@@ -22,6 +22,7 @@ import base64
 import json
 import os
 import re
+import time
 import xmlrpc.client
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -73,10 +74,21 @@ def load_config() -> dict:
 # -- Odoo XML-RPC helpers ------------------------------------------------------
 
 _uid_cache: dict[str, int] = {}
+_field_cache: dict[str, dict] = {}           # key: "url|db|model" → fields_get result
+_model_cache: dict[str, list] = {}           # key: "url|db|query|limit" → model list
+_model_cache_ts: dict[str, float] = {}       # timestamps for model cache TTL
+_MODEL_CACHE_TTL = 3600.0                    # 1 hour
+_company_cache: dict[str, tuple] = {}        # key: "url|db" → (records, timestamp)
+_COMPANY_CACHE_TTL = 600.0                   # 10 minutes
 
 
 def _get_connection(config: dict, key: str) -> dict:
     """Resolve a connection by name, inline JSON, or pipe-delimited string."""
+    if not isinstance(key, str):
+        raise ValueError(
+            f"Connection key must be a string (named key, inline JSON, or url|db|user|key), "
+            f"got {type(key).__name__}: {str(key)[:100]!r}"
+        )
     conns = config.get("connections", {})
 
     if key in conns:
@@ -340,16 +352,32 @@ def odoo_guide() -> dict:
             "Guessing field names — always call odoo_get_fields first",
             "Guessing model names — always call odoo_search_models first",
             "Using Python 'or'/'and' instead of the '|'/'&' prefix operators in domains",
+            "Calling odoo_create without odoo_default_get first — auto-filled fields cause validation errors",
+            "Calling odoo_read in a loop — pass all IDs at once for bulk read",
+            "Trying to set computed fields (e.g. amount_total) — they are read-only and auto-calculated by Odoo",
+            "Expecting odoo_execute_batch to be atomic — it is NOT; each operation runs independently",
         ],
+        "valid_context_keys": {
+            "active_test": "False to include archived/inactive records",
+            "lang": "'es_ES' or any locale code to execute in a specific language",
+            "allowed_company_ids": "[1, 2] for multi-company context",
+            "force_company": "Company ID to force context company",
+            "no_recompute": "True to skip expensive recomputations during bulk writes",
+        },
         "quick_reference": {
             "find_model": "odoo_search_models(connection, 'invoice')",
             "find_fields": "odoo_get_fields(connection, 'account.move', search_term='amount')",
-            "see_ui_fields": "odoo_get_views(connection, 'account.move', 'form')",
+            "find_writable_fields": "odoo_get_fields — check 'readonly' attribute; skip fields where readonly=True or 'compute' is set",
+            "see_ui_fields": "odoo_get_views(connection, 'account.move', 'form') — returns fields_in_view list",
             "aggregate": "odoo_read_group(connection, model, fields=['amount_total:sum'], groupby=['partner_id'])",
-            "check_defaults": "odoo_default_get(connection, model, fields) — see what Odoo auto-fills before create",
+            "check_defaults": "odoo_default_get(connection, model, fields) — call BEFORE create for any accounting model",
+            "resolve_m2o_id": "odoo_name_search(connection, 'res.partner', 'Acme Corp') — get ID from name",
+            "resolve_multiple_m2o": "odoo_name_search_batch(connection, 'res.partner', ['Acme', 'Beta Corp']) — batch lookup",
             "include_archived": "pass context={'active_test': False} to any tool",
-            "bulk_ops": "odoo_execute_batch(connection, operations=[...])",
+            "bulk_read": "odoo_read(connection, model, [id1, id2, id3], fields=[...]) — always batch, never loop",
+            "bulk_ops": "odoo_execute_batch(connection, operations=[...]) — non-atomic, check each result",
             "cross_db": "odoo_multi_db_extract(queries=[...]) — runs against all configured DBs at once",
+            "ap_ocr": "odoo_trigger_ap_worker(doc_id) — trigger AP Bill OCR worker",
         },
     }
 
@@ -400,7 +428,11 @@ def odoo_search(
 
     Returns {"records": [...], "metadata": {"count", "total", "has_more", "next_offset"}}.
     Default fields are ['id', 'display_name'] if omitted.
-    Limit is auto-capped: 1000 for narrow queries (<=5 fields), 100 for wide.
+
+    FIELD CAP RULE: limit is auto-capped based on field count:
+      - <= 5 fields: cap = 1000
+      - >  5 fields: cap =  100  ← REQUESTING MANY FIELDS DRASTICALLY REDUCES LIMIT
+    Use odoo_read_group for aggregations; request only the fields you need here.
     Use metadata.has_more + next_offset to paginate.
     """
     conn = _conn(connection)
@@ -462,7 +494,11 @@ def odoo_read(
     fields: list = [],
     context: dict = {},
 ) -> list:
-    """Read specific Odoo records by ID. Defaults to ['id', 'display_name'] if fields omitted."""
+    """
+    Read MULTIPLE Odoo records by ID in a single call. Pass a list of IDs.
+    IMPORTANT: Always pass all IDs at once — never loop and call this per record.
+    Defaults to ['id', 'display_name'] if fields omitted.
+    """
     conn = _conn(connection)
     if not fields:
         fields = ["id", "display_name"]
@@ -483,9 +519,13 @@ def odoo_create(
     """
     Create a new Odoo record. Returns {"id": <new_id>}.
 
-    BEFORE CALLING: use odoo_get_fields to know which fields are required,
-    and odoo_default_get to see what Odoo auto-fills (prevents conflicts with
-    sequences, default journals, and computed fields).
+    CRITICAL — call odoo_default_get FIRST to see what Odoo auto-fills.
+    Many models have sequences, default journals, or computed fields that
+    silently override values you supply. Skipping this causes validation
+    errors on accounting models (account.move, account.payment, etc.).
+    Use odoo_create_guided to have defaults applied automatically.
+
+    BEFORE CALLING: use odoo_get_fields to know required fields.
     """
     conn = _conn(connection)
     kw: dict[str, Any] = {}
@@ -496,6 +536,56 @@ def odoo_create(
     if isinstance(new_id, dict) and new_id.get("error"):
         return new_id
     return {"id": new_id}
+
+
+@mcp.tool()
+def odoo_create_guided(
+    connection: Connection,
+    model: str,
+    vals: dict,
+    context: dict = {},
+) -> dict:
+    """
+    Create a new Odoo record with automatic defaults applied — safer than odoo_create.
+
+    Workflow (all in one call):
+      1. Fetch defaults via default_get for the fields you're supplying
+      2. Merge: your vals override defaults (you stay in control)
+      3. Create the record
+
+    Returns {"id": <new_id>, "defaults_applied": {...}, "final_vals": {...}}
+    so you can see exactly what was sent to Odoo.
+
+    Use this for accounting models (account.move, account.payment) where
+    missing defaults cause validation errors. For simple models, odoo_create is fine.
+    """
+    conn = _conn(connection)
+    ctx = _build_context(context)
+
+    # Step 1: fetch defaults for the fields being supplied
+    default_kw: dict[str, Any] = {}
+    if ctx:
+        default_kw["context"] = ctx
+    defaults = _execute(conn, model, "default_get", list(vals.keys()), **default_kw)
+    if isinstance(defaults, dict) and defaults.get("error"):
+        defaults = {}
+
+    # Step 2: merge — caller values win
+    final_vals = {**defaults, **vals}
+
+    # Step 3: create
+    create_kw: dict[str, Any] = {}
+    if ctx:
+        create_kw["context"] = ctx
+    new_id = _execute(conn, model, "create", final_vals, **create_kw)
+    if isinstance(new_id, dict) and new_id.get("error"):
+        return new_id
+
+    return {
+        "id": new_id,
+        "defaults_applied": {k: v for k, v in defaults.items() if k not in vals},
+        "final_vals": final_vals,
+    }
 
 
 @mcp.tool()
@@ -583,7 +673,12 @@ def odoo_count(
     domain: list = [],
     context: dict = {},
 ) -> dict:
-    """Count records matching a domain filter."""
+    """
+    Count records matching a domain filter.
+    Domain syntax — AND implicit; OR uses prefix '|':
+      AND: [('field1', '=', val1), ('field2', '=', val2)]
+      OR:  ['|', ('field', '=', val1), ('field', '=', val2)]
+    """
     conn = _conn(connection)
     kw: dict[str, Any] = {}
     ctx = _build_context(context)
@@ -685,9 +780,16 @@ def odoo_read_group(
     """
     Aggregate records using read_group (like SQL GROUP BY).
     Prefer this over odoo_search when you need totals, counts, or grouped data.
-    fields: aggregation specs, e.g. ['amount_total:sum', 'id:count']
-    groupby: group dimensions, e.g. ['partner_id', 'date:month']
-    Returns {"groups": [...], "count": N} where each group has __count and aggregated values.
+
+    fields: aggregation specs — valid functions: sum, avg, min, max, count, count_distinct, array_agg
+      e.g. ['amount_total:sum', 'id:count', 'amount_residual:avg']
+    groupby: group dimensions, e.g. ['partner_id', 'date:month', 'state']
+
+    Domain syntax — AND implicit; OR uses prefix '|':
+      AND: [('field1', '=', val1), ('field2', '=', val2)]
+      OR:  ['|', ('field', '=', val1), ('field', '=', val2)]
+
+    Returns {"groups": [...], "count": N} — each group has __count and aggregated values.
     """
     conn = _conn(connection)
     kw: dict[str, Any] = {"lazy": lazy}
@@ -716,7 +818,15 @@ def odoo_name_search(
 ) -> list:
     """
     Fuzzy search by display name (like Odoo's Many2one dropdown).
-    Returns [(id, display_name), ...]. Much faster than search_read for lookups.
+    Returns [(id, display_name), ...]. Much faster than search_read for ID lookups.
+
+    Use this to resolve human names to IDs before create/write:
+      partner ID  → odoo_name_search(conn, 'res.partner', 'Acme Corp')
+      product ID  → odoo_name_search(conn, 'product.product', 'Widget A')
+      journal ID  → odoo_name_search(conn, 'account.journal', 'Bank')
+
+    domain: extra filter (AND with name match), e.g. [('customer_rank', '>', 0)]
+    operator: 'ilike' (default, case-insensitive contains), '=ilike', '='
     """
     conn = _conn(connection)
     kw: dict[str, Any] = {
@@ -729,6 +839,52 @@ def odoo_name_search(
     if ctx:
         kw["context"] = ctx
     return _execute(conn, model, "name_search", **kw)
+
+
+@mcp.tool()
+def odoo_name_search_batch(
+    connection: Connection,
+    model: str,
+    names: list,
+    operator: str = "ilike",
+    limit_per_name: int = 5,
+    context: dict = {},
+) -> dict:
+    """
+    Resolve multiple names to (id, display_name) pairs in one tool call.
+    Use instead of calling odoo_name_search repeatedly in a loop.
+
+    names: list of search terms, e.g. ['Acme Corp', 'Beta Ltd', 'Gamma Inc']
+    Returns {"results": {"Acme Corp": [(id, name), ...], ...}, "not_found": [...]}
+
+    Typical use: resolve partner names, product codes, or account names to IDs
+    before calling odoo_create or odoo_write with many2one fields.
+    """
+    conn = _conn(connection)
+    kw_base: dict[str, Any] = {
+        "args": [],
+        "operator": operator,
+        "limit": limit_per_name,
+    }
+    ctx = _build_context(context)
+    if ctx:
+        kw_base["context"] = ctx
+
+    results: dict[str, Any] = {}
+    not_found: list[str] = []
+
+    for name in names:
+        kw = {**kw_base, "name": name}
+        matches = _execute(conn, model, "name_search", **kw)
+        if isinstance(matches, dict) and matches.get("error"):
+            results[name] = matches
+        elif matches:
+            results[name] = matches
+        else:
+            results[name] = []
+            not_found.append(name)
+
+    return {"results": results, "not_found": not_found}
 
 
 @mcp.tool()
@@ -794,13 +950,27 @@ def odoo_search_models(
     connection: Connection,
     query: str = "",
     limit: int = 20,
-) -> list:
+) -> dict:
     """
     Search for Odoo models by name or description.
     Example: query='invoice' finds account.move. Returns technical name, label, and info.
+    If has_more=True, increase limit or refine query to see remaining results.
     """
     conn = _conn(connection)
-    domain = []
+    cache_key = f"{conn['url']}|{conn['db']}|{query}|{limit}"
+    now = time.time()
+    if cache_key in _model_cache and (now - _model_cache_ts.get(cache_key, 0)) < _MODEL_CACHE_TTL:
+        cached = _model_cache[cache_key]
+        has_more = len(cached) > limit
+        return {
+            "models": cached[:limit],
+            "count": min(len(cached), limit),
+            "has_more": has_more,
+            "hint": "Increase limit or refine query to see more." if has_more else "",
+            "cached": True,
+        }
+
+    domain: list = []
     if query:
         domain = [
             "|", "|",
@@ -808,11 +978,22 @@ def odoo_search_models(
             ("name", "ilike", query),
             ("info", "ilike", query),
         ]
-    return _execute(
+    models = _execute(
         conn, "ir.model", "search_read", domain,
         fields=["model", "name", "info", "state", "transient"],
-        limit=limit,
+        limit=limit + 1,
     )
+    if isinstance(models, dict) and models.get("error"):
+        return models
+    _model_cache[cache_key] = models
+    _model_cache_ts[cache_key] = now
+    has_more = len(models) > limit
+    return {
+        "models": models[:limit],
+        "count": min(len(models), limit),
+        "has_more": has_more,
+        "hint": "Increase limit or refine query to see more." if has_more else "",
+    }
 
 
 @mcp.tool()
@@ -829,10 +1010,14 @@ def odoo_get_fields(
     field_type (e.g., 'many2one', 'char', 'monetary', 'one2many').
     """
     conn = _conn(connection)
-    all_fields = _execute(conn, model, "fields_get", [], attributes=attributes)
+    cache_key = f"{conn['url']}|{conn['db']}|{model}"
+    all_fields = _field_cache.get(cache_key)
 
-    if isinstance(all_fields, dict) and all_fields.get("error"):
-        return all_fields
+    if all_fields is None:
+        all_fields = _execute(conn, model, "fields_get", [], attributes=attributes)
+        if isinstance(all_fields, dict) and all_fields.get("error"):
+            return all_fields
+        _field_cache[cache_key] = all_fields
 
     if search_term or field_type:
         filtered = {}
@@ -849,6 +1034,35 @@ def odoo_get_fields(
     return all_fields
 
 
+def _enrich_view_result(arch: str, view_id: Any, model: str, view_type: str) -> dict:
+    """Extract field metadata from view XML arch string."""
+    fields_in_view: list[str] = []
+    required_fields: list[str] = []
+    readonly_fields: list[str] = []
+    if arch:
+        for match in re.finditer(r'<field\s+([^>]+)>', arch):
+            attrs_str = match.group(1)
+            name_m = re.search(r'name=["\'](\w+)["\']', attrs_str)
+            if not name_m:
+                continue
+            fname = name_m.group(1)
+            if fname not in fields_in_view:
+                fields_in_view.append(fname)
+            if re.search(r'required=["\']1["\']', attrs_str):
+                required_fields.append(fname)
+            if re.search(r'readonly=["\']1["\']', attrs_str):
+                readonly_fields.append(fname)
+    return {
+        "arch": arch,
+        "view_id": view_id,
+        "model": model,
+        "type": view_type,
+        "fields_in_view": fields_in_view,
+        "required_fields": required_fields,
+        "readonly_fields": readonly_fields,
+    }
+
+
 @mcp.tool()
 def odoo_get_views(
     connection: Connection,
@@ -858,7 +1072,11 @@ def odoo_get_views(
 ) -> dict:
     """
     Get the XML architecture of an Odoo view (form, list, search, kanban).
-    The AI can read this XML to know exactly which fields the user sees in the UI.
+    Returns both raw arch XML and a structured summary of fields visible in the UI:
+      - fields_in_view: all field names appearing in the view
+      - required_fields: fields marked required="1" in the view
+      - readonly_fields: fields marked readonly="1" in the view
+    Use fields_in_view to know which fields matter to the user for this view.
     """
     conn = _conn(connection)
     kw: dict[str, Any] = {}
@@ -874,12 +1092,8 @@ def odoo_get_views(
         if isinstance(result, dict) and not result.get("error"):
             views = result.get("views", {})
             view_data = views.get(view_type, {})
-            return {
-                "arch": view_data.get("arch", ""),
-                "view_id": view_data.get("id"),
-                "model": model,
-                "type": view_type,
-            }
+            arch = view_data.get("arch", "")
+            return _enrich_view_result(arch, view_data.get("id"), model, view_type)
         return result
     except Exception:
         result = _execute(
@@ -887,12 +1101,8 @@ def odoo_get_views(
             view_type=view_type,
         )
         if isinstance(result, dict) and not result.get("error"):
-            return {
-                "arch": result.get("arch", ""),
-                "view_id": result.get("view_id"),
-                "model": model,
-                "type": view_type,
-            }
+            arch = result.get("arch", "")
+            return _enrich_view_result(arch, result.get("view_id"), model, view_type)
         return result
 
 
@@ -946,6 +1156,8 @@ def odoo_check_access(
     """
     Check current user's access rights on a model (read/write/create/unlink).
     Queries ir.model.access for the user's groups.
+    Call this before attempting writes/deletes on unfamiliar models to avoid
+    unexpected AccessError failures at execution time.
     """
     conn = _conn(connection)
 
@@ -969,10 +1181,18 @@ def odoo_check_access(
 def odoo_list_companies(connection: Connection) -> list:
     """List all companies in an Odoo database (for multi-company setups)."""
     conn = _conn(connection)
-    return _execute(
+    cache_key = f"{conn['url']}|{conn['db']}"
+    now = time.time()
+    cached_entry = _company_cache.get(cache_key)
+    if cached_entry and (now - cached_entry[1]) < _COMPANY_CACHE_TTL:
+        return cached_entry[0]
+    result = _execute(
         conn, "res.company", "search_read", [],
         fields=["id", "name", "currency_id", "country_id"],
     )
+    if not (isinstance(result, dict) and result.get("error")):
+        _company_cache[cache_key] = (result, now)
+    return result
 
 
 # =============================================================================
@@ -987,7 +1207,12 @@ def odoo_execute_batch(
     """
     Execute multiple Odoo operations in a single tool call.
     Each operation: {"model": "...", "method": "...", "args": [...], "kwargs": {...}}
-    Returns a list of results in the same order.
+
+    IMPORTANT: Operations are NOT atomic. If operation [2] fails, operations [0,1,3,4...]
+    still execute — there is no rollback. Check results[i] for {"error": True} on each item.
+    For atomic multi-step workflows, use a server action instead (odoo_run_server_action).
+
+    Returns {"results": [...], "count": N} — results are in the same order as operations.
     """
     conn = _conn(connection)
     results = []
@@ -1021,8 +1246,23 @@ def odoo_upload_attachment(
     Upload a file to Odoo as an ir.attachment.
     data_base64: the file content encoded as base64.
     Optionally attach to a record by setting res_model and res_id.
+    Maximum file size: 25 MB (Odoo's default upload limit).
     """
     conn = _conn(connection)
+
+    # Validate base64 and enforce size limit
+    try:
+        raw_bytes = base64.b64decode(data_base64, validate=True)
+    except Exception:
+        return {"error": True, "message": "data_base64 is not valid base64-encoded data."}
+    max_bytes = 25 * 1024 * 1024  # 25 MB
+    if len(raw_bytes) > max_bytes:
+        size_mb = len(raw_bytes) / (1024 * 1024)
+        return {
+            "error": True,
+            "message": f"File too large: {size_mb:.1f} MB. Odoo's default limit is 25 MB.",
+        }
+
     vals: dict[str, Any] = {
         "name": name,
         "datas": data_base64,
