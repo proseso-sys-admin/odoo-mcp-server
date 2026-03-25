@@ -23,17 +23,22 @@ python main.py
 
 ## Deploying
 
-**Windows (PowerShell):**
+Push to `master` triggers Cloud Build automatically → Docker build → deploy to Cloud Run.
+
+**Do NOT use `gcloud builds submit`** on this repo — it creates a duplicate deploy.
+
+### Deploy flow
+1. Push to feature branch → open PR
+2. `odoo-mcp-server-pr-check` runs (ruff lint + format)
+3. PR check must pass before merge (branch protection)
+4. Merge to `master` → `odoo-mcp-server-deploy` trigger fires → Cloud Run updated
+
+Cloud Run service: `odoo-mcp-server` in `asia-southeast1`, project `odoo-ocr-487104`.
+
+**Windows (PowerShell) — manual deploy:**
 ```powershell
 .\deploy.ps1
 ```
-
-**CI/CD via Cloud Build:**
-```bash
-gcloud builds submit . --config cloudbuild.yaml --project odoo-ocr-487104
-```
-
-Cloud Run service: `odoo-mcp-server` in region `asia-southeast1`, project `odoo-ocr-487104`.
 
 ## Quality Tools
 
