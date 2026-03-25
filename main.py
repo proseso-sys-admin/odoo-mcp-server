@@ -24,19 +24,15 @@ import os
 import re
 import time
 import xmlrpc.client
-from contextlib import asynccontextmanager
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
-import anyio
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
-from mcp.server.sse import SseServerTransport
 from sse_starlette.sse import EventSourceResponse
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
-from starlette.types import Receive, Scope, Send
 
 # -- Type aliases --------------------------------------------------------------
 
@@ -51,13 +47,18 @@ Connection = Annotated[
 # -- Constants -----------------------------------------------------------------
 
 DEFAULT_LIMIT = 100
-HARD_CAP_NARROW = 1000   # max when fields <= 5
-HARD_CAP_WIDE = 100      # max when fields > 5 or unspecified
+HARD_CAP_NARROW = 1000  # max when fields <= 5
+HARD_CAP_WIDE = 100  # max when fields > 5 or unspecified
 NARROW_FIELD_THRESHOLD = 5
 
-PROTECTED_MODELS = frozenset({
-    "ir.model", "ir.module.module", "res.company", "base",
-})
+PROTECTED_MODELS = frozenset(
+    {
+        "ir.model",
+        "ir.module.module",
+        "res.company",
+        "base",
+    }
+)
 
 # -- Config --------------------------------------------------------------------
 
@@ -74,12 +75,12 @@ def load_config() -> dict:
 # -- Odoo XML-RPC helpers ------------------------------------------------------
 
 _uid_cache: dict[str, int] = {}
-_field_cache: dict[str, dict] = {}           # key: "url|db|model" → fields_get result
-_model_cache: dict[str, list] = {}           # key: "url|db|query|limit" → model list
-_model_cache_ts: dict[str, float] = {}       # timestamps for model cache TTL
-_MODEL_CACHE_TTL = 3600.0                    # 1 hour
-_company_cache: dict[str, tuple] = {}        # key: "url|db" → (records, timestamp)
-_COMPANY_CACHE_TTL = 600.0                   # 10 minutes
+_field_cache: dict[str, dict] = {}  # key: "url|db|model" → fields_get result
+_model_cache: dict[str, list] = {}  # key: "url|db|query|limit" → model list
+_model_cache_ts: dict[str, float] = {}  # timestamps for model cache TTL
+_MODEL_CACHE_TTL = 3600.0  # 1 hour
+_company_cache: dict[str, tuple] = {}  # key: "url|db" → (records, timestamp)
+_COMPANY_CACHE_TTL = 600.0  # 10 minutes
 
 
 def _get_connection(config: dict, key: str) -> dict:
@@ -115,9 +116,7 @@ def _get_connection(config: dict, key: str) -> dict:
         host = urlparse(parts[0]).hostname or ""
         return {"url": parts[0], "db": host.split(".")[0], "user": parts[1], "api_key": parts[2]}
 
-    raise ValueError(
-        f"Connection '{key}' not found. Available: {list(conns.keys())}"
-    )
+    raise ValueError(f"Connection '{key}' not found. Available: {list(conns.keys())}")
 
 
 def _authenticate(conn: dict) -> tuple[str, int, str]:
@@ -129,23 +128,20 @@ def _authenticate(conn: dict) -> tuple[str, int, str]:
     cache_key = f"{url}|{db}|{user}"
     if cache_key not in _uid_cache:
         try:
-            common = xmlrpc.client.ServerProxy(
-                f"{url}/xmlrpc/2/common", allow_none=True
-            )
+            common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
             uid = common.authenticate(db, user, api_key, {})
         except xmlrpc.client.Fault as e:
             raise ValueError(
                 f"Odoo rejected authentication for {user}@{db} on {url}: {str(e.faultString)[:200]}"
-            )
+            ) from e
         except Exception as e:
             raise ValueError(
                 f"Cannot reach Odoo at {url}: {type(e).__name__}: {str(e)[:200]}. "
                 "Check that the URL is correct and the server is reachable."
-            )
+            ) from e
         if not uid:
             raise ValueError(
-                f"Authentication failed for {user}@{db} on {url}. "
-                "Check URL, database name, user login, and API key."
+                f"Authentication failed for {user}@{db} on {url}. Check URL, database name, user login, and API key."
             )
         _uid_cache[cache_key] = uid
 
@@ -168,9 +164,7 @@ def _execute(conn: dict, model: str, method: str, *args, **kwargs) -> Any:
 
     url, uid, api_key = _authenticate(conn)
     db = conn["db"]
-    obj = xmlrpc.client.ServerProxy(
-        f"{url}/xmlrpc/2/object", allow_none=True
-    )
+    obj = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     try:
         return obj.execute_kw(db, uid, api_key, model, method, list(args), kwargs)
     except xmlrpc.client.Fault as e:
@@ -220,17 +214,10 @@ def _parse_xmlrpc_error(fault: xmlrpc.client.Fault, model: str, method: str) -> 
     msg = str(fault.faultString)
     result: dict[str, Any] = {"error": True, "raw": msg[:500]}
 
-    field_match = re.search(
-        r"Invalid field '(\w+)' on model '([\w.]+)'", msg
-    )
+    field_match = re.search(r"Invalid field '(\w+)' on model '([\w.]+)'", msg)
     if field_match:
-        result["message"] = (
-            f"Field '{field_match.group(1)}' does not exist on model "
-            f"'{field_match.group(2)}'."
-        )
-        result["hint"] = (
-            "Call odoo_get_fields to discover valid field names for this model."
-        )
+        result["message"] = f"Field '{field_match.group(1)}' does not exist on model '{field_match.group(2)}'."
+        result["hint"] = "Call odoo_get_fields to discover valid field names for this model."
         return result
 
     access_match = re.search(r"AccessError", msg)
@@ -269,18 +256,20 @@ def _parse_xmlrpc_error(fault: xmlrpc.client.Fault, model: str, method: str) -> 
 # -- SSE keep-alive patch ------------------------------------------------------
 # The MCP SDK creates EventSourceResponse without a ping interval, so Cloud Run
 # (and similar proxies) kill the idle SSE connection at their request timeout
-# boundary. We permanently patch EventSourceResponse to inject ping=15 (seconds) 
-# and a custom ping message factory that sends an actual event instead of a 
+# boundary. We permanently patch EventSourceResponse to inject ping=15 (seconds)
+# and a custom ping message factory that sends an actual event instead of a
 # comment, as some SSE client polyfills ignore comments for keep-alive tracking.
 
-from sse_starlette.sse import EventSourceResponse, ServerSentEvent
+from sse_starlette.sse import ServerSentEvent  # noqa: E402
 
-_orig_ESR = EventSourceResponse.__init__
+_orig_esr = EventSourceResponse.__init__
+
 
 def _patched_esr_init(esr_self, *args, **kwargs):
     kwargs.setdefault("ping", 15)
     kwargs.setdefault("ping_message_factory", lambda: ServerSentEvent(event="ping", data="keepalive"))
-    _orig_ESR(esr_self, *args, **kwargs)
+    _orig_esr(esr_self, *args, **kwargs)
+
 
 EventSourceResponse.__init__ = _patched_esr_init
 
@@ -291,13 +280,12 @@ mcp = FastMCP(
     "odoo-connect",
     host="0.0.0.0",
     port=_port,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False
-    ),
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
 # -- Helper to resolve connection shorthand -----------------------------------
+
 
 def _conn(connection: str) -> dict:
     """Shorthand: resolve a connection key/JSON to a connection dict."""
@@ -309,6 +297,7 @@ def _conn(connection: str) -> dict:
 # AUTHENTICATION & CONNECTIONS
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_list_connections() -> dict:
     """List all configured Odoo connections (databases). Call this first to discover available connection keys."""
@@ -316,8 +305,7 @@ def odoo_list_connections() -> dict:
     conns = config.get("connections", {})
     return {
         "connections": {
-            k: {"url": v.get("url"), "db": v.get("db"), "user": v.get("user", "admin")}
-            for k, v in conns.items()
+            k: {"url": v.get("url"), "db": v.get("db"), "user": v.get("user", "admin")} for k, v in conns.items()
         },
         "default": config.get("default"),
     }
@@ -405,16 +393,17 @@ def odoo_authenticate(url: str, user: str, api_key: str, db: str = "", transport
 # CORE CRUD — with context-window protection
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_search(
     connection: Connection,
     model: str,
-    domain: list = [],
-    fields: list = [],
+    domain: list = [],  # noqa: B006
+    fields: list = [],  # noqa: B006
     limit: int = 0,
     offset: int = 0,
     order: str = "",
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Search Odoo records (search_read) with smart pagination.
@@ -479,9 +468,7 @@ def odoo_search(
         "next_offset": offset + len(records),
     }
     if capped:
-        meta["warning"] = (
-            f"Limit capped to {cap}. Request <=5 fields to allow up to {HARD_CAP_NARROW}."
-        )
+        meta["warning"] = f"Limit capped to {cap}. Request <=5 fields to allow up to {HARD_CAP_NARROW}."
 
     return {"records": records, "metadata": meta}
 
@@ -491,8 +478,8 @@ def odoo_read(
     connection: Connection,
     model: str,
     ids: list,
-    fields: list = [],
-    context: dict = {},
+    fields: list = [],  # noqa: B006
+    context: dict = {},  # noqa: B006
 ) -> list:
     """
     Read MULTIPLE Odoo records by ID in a single call. Pass a list of IDs.
@@ -514,7 +501,7 @@ def odoo_create(
     connection: Connection,
     model: str,
     vals: dict,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Create a new Odoo record. Returns {"id": <new_id>}.
@@ -543,7 +530,7 @@ def odoo_create_guided(
     connection: Connection,
     model: str,
     vals: dict,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Create a new Odoo record with automatic defaults applied — safer than odoo_create.
@@ -594,7 +581,7 @@ def odoo_write(
     model: str,
     ids: list,
     vals: dict,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Update existing Odoo records. Returns {"success": True, "updated_ids": [...]}.
@@ -618,7 +605,7 @@ def odoo_delete(
     connection: Connection,
     model: str,
     ids: list,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Delete Odoo records (unlink). Refuses to delete records from protected system models.
@@ -627,8 +614,7 @@ def odoo_delete(
     if model in PROTECTED_MODELS:
         return {
             "error": True,
-            "message": f"Deletion from '{model}' is blocked for safety. "
-                       "Use odoo_call if you truly need this."
+            "message": f"Deletion from '{model}' is blocked for safety. Use odoo_call if you truly need this.",
         }
     conn = _conn(connection)
     kw: dict[str, Any] = {}
@@ -646,8 +632,8 @@ def odoo_copy(
     connection: Connection,
     model: str,
     id: int,
-    default: dict = {},
-    context: dict = {},
+    default: dict = {},  # noqa: B006
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Duplicate an Odoo record using copy(). Pass 'default' dict to override fields
@@ -670,8 +656,8 @@ def odoo_copy(
 def odoo_count(
     connection: Connection,
     model: str,
-    domain: list = [],
-    context: dict = {},
+    domain: list = [],  # noqa: B006
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Count records matching a domain filter.
@@ -695,9 +681,9 @@ def odoo_call(
     connection: Connection,
     model: str,
     method: str,
-    args: list = [],
-    kwargs: dict = {},
-    context: dict = {},
+    args: list = [],  # noqa: B006
+    kwargs: dict = {},  # noqa: B006
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Call any Odoo method directly (execute_kw).
@@ -720,6 +706,7 @@ def odoo_call(
 # MESSAGING & CHATTER
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_send_message(
     connection: Connection,
@@ -729,8 +716,8 @@ def odoo_send_message(
     subject: str = "",
     message_type: str = "comment",
     subtype_xmlid: str = "mail.mt_comment",
-    partner_ids: list = [],
-    context: dict = {},
+    partner_ids: list = [],  # noqa: B006
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Post a message or send an email via Odoo's Chatter on a specific record.
@@ -765,17 +752,18 @@ def odoo_send_message(
 # ADVANCED ORM TOOLS
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_read_group(
     connection: Connection,
     model: str,
-    domain: list = [],
-    fields: list = [],
-    groupby: list = [],
+    domain: list = [],  # noqa: B006
+    fields: list = [],  # noqa: B006
+    groupby: list = [],  # noqa: B006
     orderby: str = "",
     limit: int = 0,
     lazy: bool = True,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Aggregate records using read_group (like SQL GROUP BY).
@@ -811,10 +799,10 @@ def odoo_name_search(
     connection: Connection,
     model: str,
     name: str = "",
-    domain: list = [],
+    domain: list = [],  # noqa: B006
     operator: str = "ilike",
     limit: int = 10,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> list:
     """
     Fuzzy search by display name (like Odoo's Many2one dropdown).
@@ -848,7 +836,7 @@ def odoo_name_search_batch(
     names: list,
     operator: str = "ilike",
     limit_per_name: int = 5,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Resolve multiple names to (id, display_name) pairs in one tool call.
@@ -876,9 +864,7 @@ def odoo_name_search_batch(
     for name in names:
         kw = {**kw_base, "name": name}
         matches = _execute(conn, model, "name_search", **kw)
-        if isinstance(matches, dict) and matches.get("error"):
-            results[name] = matches
-        elif matches:
+        if (isinstance(matches, dict) and matches.get("error")) or matches:
             results[name] = matches
         else:
             results[name] = []
@@ -892,7 +878,7 @@ def odoo_name_create(
     connection: Connection,
     model: str,
     name: str,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Quick-create a record by display name only (like Many2one quick-create).
@@ -913,8 +899,8 @@ def odoo_name_create(
 def odoo_default_get(
     connection: Connection,
     model: str,
-    fields: list = [],
-    context: dict = {},
+    fields: list = [],  # noqa: B006
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Get default values Odoo would pre-fill for a new record.
@@ -945,6 +931,7 @@ def odoo_get_metadata(
 # SCHEMA DISCOVERY & INTROSPECTION
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_search_models(
     connection: Connection,
@@ -973,13 +960,17 @@ def odoo_search_models(
     domain: list = []
     if query:
         domain = [
-            "|", "|",
+            "|",
+            "|",
             ("model", "ilike", query),
             ("name", "ilike", query),
             ("info", "ilike", query),
         ]
     models = _execute(
-        conn, "ir.model", "search_read", domain,
+        conn,
+        "ir.model",
+        "search_read",
+        domain,
         fields=["model", "name", "info", "state", "transient"],
         limit=limit + 1,
     )
@@ -1000,7 +991,7 @@ def odoo_search_models(
 def odoo_get_fields(
     connection: Connection,
     model: str,
-    attributes: list = ["string", "type", "required", "relation", "help"],
+    attributes: list = ["string", "type", "required", "relation", "help"],  # noqa: B006
     search_term: str = "",
     field_type: str = "",
 ) -> dict:
@@ -1040,7 +1031,7 @@ def _enrich_view_result(arch: str, view_id: Any, model: str, view_type: str) -> 
     required_fields: list[str] = []
     readonly_fields: list[str] = []
     if arch:
-        for match in re.finditer(r'<field\s+([^>]+)>', arch):
+        for match in re.finditer(r"<field\s+([^>]+)>", arch):
             attrs_str = match.group(1)
             name_m = re.search(r'name=["\'](\w+)["\']', attrs_str)
             if not name_m:
@@ -1068,7 +1059,7 @@ def odoo_get_views(
     connection: Connection,
     model: str,
     view_type: str = "form",
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Get the XML architecture of an Odoo view (form, list, search, kanban).
@@ -1085,7 +1076,9 @@ def odoo_get_views(
         kw["context"] = ctx
     try:
         result = _execute(
-            conn, model, "get_views",
+            conn,
+            model,
+            "get_views",
             [[False, view_type]],
             **kw,
         )
@@ -1097,7 +1090,9 @@ def odoo_get_views(
         return result
     except Exception:
         result = _execute(
-            conn, model, "fields_view_get",
+            conn,
+            model,
+            "fields_view_get",
             view_type=view_type,
         )
         if isinstance(result, dict) and not result.get("error"):
@@ -1119,7 +1114,9 @@ def odoo_get_menus(
     conn = _conn(connection)
     if model:
         actions = _execute(
-            conn, "ir.actions.act_window", "search_read",
+            conn,
+            "ir.actions.act_window",
+            "search_read",
             [("res_model", "=", model)],
             fields=["id", "name", "res_model", "view_mode", "domain", "context"],
             limit=limit,
@@ -1127,14 +1124,14 @@ def odoo_get_menus(
         if isinstance(actions, dict) and actions.get("error"):
             return actions
 
-        action_ids = [
-            f"ir.actions.act_window,{a['id']}" for a in actions
-        ]
+        action_ids = [f"ir.actions.act_window,{a['id']}" for a in actions]
         if not action_ids:
             return {"message": f"No menu actions found for model '{model}'."}
 
         menus = _execute(
-            conn, "ir.ui.menu", "search_read",
+            conn,
+            "ir.ui.menu",
+            "search_read",
             [("action", "in", action_ids)],
             fields=["id", "name", "complete_name", "action", "parent_id"],
             limit=limit,
@@ -1142,7 +1139,10 @@ def odoo_get_menus(
         return {"actions": actions, "menus": menus}
 
     return _execute(
-        conn, "ir.ui.menu", "search_read", [],
+        conn,
+        "ir.ui.menu",
+        "search_read",
+        [],
         fields=["id", "name", "complete_name", "parent_id", "action"],
         limit=limit,
     )
@@ -1162,7 +1162,9 @@ def odoo_check_access(
     conn = _conn(connection)
 
     access_records = _execute(
-        conn, "ir.model.access", "search_read",
+        conn,
+        "ir.model.access",
+        "search_read",
         [("model_id.model", "=", model)],
         fields=["name", "group_id", "perm_read", "perm_write", "perm_create", "perm_unlink"],
         limit=50,
@@ -1187,7 +1189,10 @@ def odoo_list_companies(connection: Connection) -> list:
     if cached_entry and (now - cached_entry[1]) < _COMPANY_CACHE_TTL:
         return cached_entry[0]
     result = _execute(
-        conn, "res.company", "search_read", [],
+        conn,
+        "res.company",
+        "search_read",
+        [],
         fields=["id", "name", "currency_id", "country_id"],
     )
     if not (isinstance(result, dict) and result.get("error")):
@@ -1198,6 +1203,7 @@ def odoo_list_companies(connection: Connection) -> list:
 # =============================================================================
 # BATCH EXECUTION
 # =============================================================================
+
 
 @mcp.tool()
 def odoo_execute_batch(
@@ -1233,6 +1239,7 @@ def odoo_execute_batch(
 # FILE & ATTACHMENT MANAGEMENT
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_upload_attachment(
     connection: Connection,
@@ -1240,7 +1247,7 @@ def odoo_upload_attachment(
     data_base64: str,
     res_model: str = "",
     res_id: int = 0,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Upload a file to Odoo as an ir.attachment.
@@ -1294,7 +1301,10 @@ def odoo_download_attachment(
     """
     conn = _conn(connection)
     records = _execute(
-        conn, "ir.attachment", "read", [attachment_id],
+        conn,
+        "ir.attachment",
+        "read",
+        [attachment_id],
         fields=["name", "datas", "mimetype", "file_size"],
     )
     if isinstance(records, dict) and records.get("error"):
@@ -1315,12 +1325,13 @@ def odoo_download_attachment(
 # REPORT GENERATION
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_get_report(
     connection: Connection,
     report_name: str,
     record_ids: list,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Generate an Odoo PDF report (invoice, delivery slip, etc.).
@@ -1331,17 +1342,13 @@ def odoo_get_report(
     url, uid, api_key = _authenticate(conn)
     db = conn["db"]
 
-    report_obj = xmlrpc.client.ServerProxy(
-        f"{url}/xmlrpc/2/report", allow_none=True
-    )
+    report_obj = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/report", allow_none=True)
     try:
         kw: dict[str, Any] = {}
         ctx = _build_context(context)
         if ctx:
             kw["context"] = ctx
-        result = report_obj.render_report(
-            db, uid, api_key, report_name, record_ids, kw
-        )
+        result = report_obj.render_report(db, uid, api_key, report_name, record_ids, kw)
         if isinstance(result, dict) and result.get("result"):
             return {
                 "report_name": report_name,
@@ -1360,11 +1367,12 @@ def odoo_get_report(
 # SERVER ACTIONS & CRONS
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_run_server_action(
     connection: Connection,
     action_id: int,
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Execute an ir.actions.server record (custom business logic configured in Odoo).
@@ -1396,9 +1404,11 @@ def odoo_list_crons(
     if active_only:
         domain.append(("active", "=", True))
     return _execute(
-        conn, "ir.cron", "search_read", domain,
-        fields=["id", "name", "model_id", "interval_number", "interval_type",
-                "nextcall", "active", "numbercall"],
+        conn,
+        "ir.cron",
+        "search_read",
+        domain,
+        fields=["id", "name", "model_id", "interval_number", "interval_type", "nextcall", "active", "numbercall"],
         limit=100,
     )
 
@@ -1420,6 +1430,7 @@ def odoo_trigger_cron(
 # CUSTOM FIELD CREATION (Studio-less)
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_create_custom_field(
     connection: Connection,
@@ -1429,11 +1440,11 @@ def odoo_create_custom_field(
     string: str = "",
     required: bool = False,
     help: str = "",
-    selection: list = [],
+    selection: list = [],  # noqa: B006
     relation: str = "",
     relation_field: str = "",
     domain: str = "",
-    context: dict = {},
+    context: dict = {},  # noqa: B006
 ) -> dict:
     """
     Create a custom x_ field on an Odoo model via ir.model.fields (no Studio needed).
@@ -1446,7 +1457,9 @@ def odoo_create_custom_field(
     conn = _conn(connection)
 
     model_records = _execute(
-        conn, "ir.model", "search_read",
+        conn,
+        "ir.model",
+        "search_read",
         [("model", "=", model)],
         fields=["id"],
         limit=1,
@@ -1466,9 +1479,7 @@ def odoo_create_custom_field(
     if help:
         vals["help"] = help
     if selection and field_type == "selection":
-        vals["selection_ids"] = [
-            (0, 0, {"value": s[0], "name": s[1]}) for s in selection
-        ]
+        vals["selection_ids"] = [(0, 0, {"value": s[0], "name": s[1]}) for s in selection]
     if relation:
         vals["relation"] = relation
     if relation_field:
@@ -1491,10 +1502,11 @@ def odoo_create_custom_field(
 # MULTI-DATABASE EXTRACTION
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_multi_db_extract(
     queries: list,
-    connections: list = [],
+    connections: list = [],  # noqa: B006
     stop_on_error: bool = False,
 ) -> dict:
     """
@@ -1556,7 +1568,10 @@ def odoo_multi_db_extract(
 
     target_keys = connections if connections else list(all_conns.keys())
     if not target_keys:
-        return {"error": True, "message": "No connections configured. Set ODOO_CONNECTIONS or pass explicit connection keys."}
+        return {
+            "error": True,
+            "message": "No connections configured. Set ODOO_CONNECTIONS or pass explicit connection keys.",
+        }
 
     if not queries:
         return {"error": True, "message": "No queries provided. Pass at least one query dict with 'label' and 'model'."}
@@ -1664,7 +1679,9 @@ def odoo_multi_db_extract(
                     group_result = _execute(conn, model, "read_group", domain, fields, groupby, **kw)
                     if isinstance(group_result, dict) and group_result.get("error"):
                         conn_result["queries"][label] = group_result
-                        conn_result["errors"].append({"label": label, "error": group_result.get("message", str(group_result))})
+                        conn_result["errors"].append(
+                            {"label": label, "error": group_result.get("message", str(group_result))}
+                        )
                     else:
                         conn_result["queries"][label] = {
                             "groups": group_result,
@@ -1718,14 +1735,15 @@ def odoo_multi_db_extract(
 # AP WORKER (existing)
 # =============================================================================
 
+
 @mcp.tool()
 def odoo_trigger_ap_worker(doc_id: int, target_key: str = "") -> dict:
     """
     Trigger the AP Bill OCR Worker to process a document by its Odoo document ID.
     Requires ODOO_AP_WORKER_URL and ODOO_AP_WORKER_SECRET environment variables.
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     worker_url = os.environ.get("ODOO_AP_WORKER_URL", "").rstrip("/")
     worker_secret = os.environ.get("ODOO_AP_WORKER_SECRET", "")
@@ -1738,7 +1756,7 @@ def odoo_trigger_ap_worker(doc_id: int, target_key: str = "") -> dict:
         payload["target_key"] = target_key
 
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310
         f"{worker_url}/webhook/document-upload",
         data=data,
         headers={
@@ -1749,13 +1767,14 @@ def odoo_trigger_ap_worker(doc_id: int, target_key: str = "") -> dict:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
             return {"status": resp.status, "response": resp.read().decode()}
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}", "response": e.read().decode()}
 
 
 # -- Health check --------------------------------------------------------------
+
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> PlainTextResponse:
